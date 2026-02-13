@@ -11,6 +11,7 @@ import (
 	//	"bytes"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
@@ -19,16 +20,33 @@ import (
 	tester "6.5840/tester1"
 )
 
+type (
+	RaftState int
+	Hearbeat  struct{}
+)
+
+const (
+	Follower RaftState = iota
+	CandidateId
+	Leader
+)
+
+const HeartbeatInterval = 100 * time.Millisecond
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *tester.Persister   // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
+	mu         sync.Mutex          // Lock to protect shared access to this peer's state
+	peers      []*labrpc.ClientEnd // RPC end points of all peers
+	persister  *tester.Persister   // Object to hold this peer's persisted state
+	me         int                 // this peer's index into peers[]
+	dead       int32
+	HearbeatCh chan Hearbeat
 
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	// Persistent state
+	state       RaftState
 	currentTerm int
 	votedFor    int
 	log         []LogEntry
@@ -51,6 +69,18 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (3A).
 	return term, isleader
+}
+
+func (rf *Raft) isLeader() bool {
+	rf.mu.Unlock()
+	defer rf.mu.Unlock()
+	return rf.state == Leader
+}
+
+func (rf *Raft) isFollower() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.state == Follower
 }
 
 // save Raft's persistent state to stable storage,
@@ -178,6 +208,8 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {}
 
+func (rf *Raft) sendHearbeat() {}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -199,16 +231,52 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
+// the tester doesn't halt goroutines created by Raft after each test,
+// but it does call the Kill() method. your code can use killed() to
+// check whether Kill() has been called. the use of atomic avoids the
+// need for a lock.
+//
+// the issue is that long-running goroutines use memory and may chew
+// up CPU time, perhaps causing later tests to fail and generating
+// confusing debug output. any goroutine with a long-running loop
+// should call killed() to check whether it should stop.
+func (rf *Raft) Kill() {
+	atomic.StoreInt32(&rf.dead, 1)
+	// Your code here, if desired.
+}
+
+func (rf *Raft) killed() bool {
+	z := atomic.LoadInt32(&rf.dead)
+	return z == 1
+}
+func (rf *Raft) startElection() {}
+func (rf *Raft) getTimeout() time.Duration {
+	ms := 600 + (rand.Int63() % 300)
+	return time.Duration(ms) * time.Millisecond
+}
 func (rf *Raft) ticker() {
-	for true {
 
-		// Your code here (3A)
-		// Check if a leader election should be started.
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+	// Your code here (3A)
+	// Check if a leader election should be started.
+	electionTimer := time.NewTimer(rf.getTimeout())
+	heartbeatTimer := time.NewTimer(HeartbeatInterval)
+	for !rf.killed() {
+		select {
+		case <-rf.HearbeatCh:
+			DPrintf("Reset HeartbeatTimer %v", rf.me)
+			electionTimer.Reset(rf.getTimeout())
+		case <-electionTimer.C:
+			if rf.isFollower() {
+				DPrintf("Timeout! start Election! %v", rf.me)
+				rf.startElection()
+			}
+			electionTimer.Reset(rf.getTimeout())
+		case <-heartbeatTimer.C:
+			if rf.isLeader() {
+				rf.sendHearbeat()
+			}
+			heartbeatTimer.Reset(HeartbeatInterval)
+		}
 	}
 }
 
