@@ -32,6 +32,7 @@ const (
 )
 
 const HeartbeatInterval = 100 * time.Millisecond
+const ElectionInterval = 5 * time.Second
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -71,6 +72,25 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+func (rf *Raft) upgrade() {
+	if rf.state < 2 {
+		rf.state += 1
+	}
+}
+
+func (rf *Raft) downgrade(level RaftState) {
+	if rf.state > 0 {
+		rf.state -= level
+	}
+}
+
+func (rf *Raft) updateTerm(newTerm int) {
+	if newTerm > rf.currentTerm {
+		rf.currentTerm = newTerm
+		rf.votedFor = -1
+		rf.state = Follower
+	}
+}
 func (rf *Raft) isLeader() bool {
 	rf.mu.Unlock()
 	defer rf.mu.Unlock()
@@ -158,6 +178,17 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	rf.updateTerm(args.Term)
+	reply.Term = rf.currentTerm
+
+	if rf.votedFor == -1 {
+		rf.votedFor = args.CandidateId
+		reply.VoteGranted = true
+	} else {
+		reply.VoteGranted = false
+	}
+	DPrintf("%v vote %v: %v %v %v", rf.me, args.CandidateId, args.Term, rf.currentTerm, reply.VoteGranted)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -187,9 +218,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+func (rf *Raft) sendRequestVote(ch chan RequestVoteReply) {
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+
+		go func(server int) {
+			rf.mu.Lock()
+			args := RequestVoteArgs{
+				Term:        rf.currentTerm,
+				CandidateId: rf.me,
+			}
+			rf.mu.Unlock()
+			reply := RequestVoteReply{}
+			rf.peers[server].Call("Raft.RequestVote", &args, &reply)
+			ch <- reply
+		}(i)
+
+	}
 }
 
 type AppendEntriesArgs struct {
@@ -249,7 +296,56 @@ func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
 }
-func (rf *Raft) startElection() {}
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+	rf.currentTerm += 1
+	rf.votedFor = rf.me
+	rf.upgrade()
+	rf.mu.Unlock()
+
+	voteCh := make(chan RequestVoteReply)
+	rf.sendRequestVote(voteCh)
+
+	timer := time.After(ElectionInterval)
+	respose := 0
+	vote := 1
+	for respose < len(rf.peers)-1 {
+		select {
+		case reply := <-voteCh:
+			rf.mu.Lock()
+
+			respose++
+			if reply.VoteGranted {
+				vote++
+				if vote > len(rf.peers)/2 {
+					DPrintf("%v become Leader!", rf.me)
+					rf.upgrade()
+					rf.mu.Unlock()
+					return
+				}
+				rf.mu.Unlock()
+			} else {
+				rf.updateTerm(reply.Term)
+				rf.mu.Unlock()
+				DPrintf("Election failed: Downgrade! %v", rf.me)
+				return
+			}
+		case <-rf.HearbeatCh:
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			rf.downgrade(1)
+			DPrintf("Election failed: Leader exists %v", rf.me)
+			return
+
+		case <-timer:
+			DPrintf("Election failed: TimeOut! %v", rf.me)
+			rf.startElection()
+
+		}
+	}
+}
+
 func (rf *Raft) getTimeout() time.Duration {
 	ms := 600 + (rand.Int63() % 300)
 	return time.Duration(ms) * time.Millisecond
