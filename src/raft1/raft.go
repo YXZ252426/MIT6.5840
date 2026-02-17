@@ -92,7 +92,7 @@ func (rf *Raft) updateTerm(newTerm int) {
 	}
 }
 func (rf *Raft) isLeader() bool {
-	rf.mu.Unlock()
+	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.state == Leader
 }
@@ -179,6 +179,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.updateTerm(args.Term)
 	reply.Term = rf.currentTerm
 
@@ -244,22 +245,22 @@ type AppendEntriesArgs struct {
 	LeaderId      int
 	PrevLogIndex  int
 	PrevLogTerm   int
-	entries       []LogEntry
-	leaderaCommit int
+	Entries       []LogEntry
+	LeaderaCommit int
 }
 
 type AppendEntriesReply struct {
 	Term    int
-	success bool
+	Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
-		reply.Term, reply.success = rf.currentTerm, false
+		reply.Term, reply.Success = rf.currentTerm, false
 	} else {
-		reply.Term, reply.success = rf.currentTerm, true
+		reply.Term, reply.Success = rf.currentTerm, true
 		rf.updateTerm(args.Term)
 
 		select {
@@ -269,7 +270,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 }
 
-func (rf *Raft) sendHearbeat() {
+func (rf *Raft) sendHeartbeat() {
 	respondCh := make(chan bool, len(rf.peers)-1)
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -285,7 +286,7 @@ func (rf *Raft) sendHearbeat() {
 		go func(server int) {
 			reply := AppendEntriesReply{}
 			ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
-			if ok && !reply.success {
+			if ok && !reply.Success {
 				rf.mu.Lock()
 				rf.updateTerm(reply.Term)
 				rf.mu.Unlock()
@@ -377,14 +378,14 @@ func (rf *Raft) startElection() {
 	rf.sendRequestVote(voteCh)
 
 	timer := time.After(ElectionInterval)
-	respose := 0
+	response := 0
 	vote := 1
-	for respose < len(rf.peers)-1 {
+	for response < len(rf.peers)-1 {
 		select {
 		case reply := <-voteCh:
 			rf.mu.Lock()
 
-			respose++
+			response++
 			if reply.VoteGranted {
 				vote++
 				if vote > len(rf.peers)/2 {
@@ -439,7 +440,7 @@ func (rf *Raft) ticker() {
 			electionTimer.Reset(rf.getTimeout())
 		case <-heartbeatTimer.C:
 			if rf.isLeader() {
-				rf.sendHearbeat()
+				rf.sendHeartbeat()
 			}
 			heartbeatTimer.Reset(HeartbeatInterval)
 		}
