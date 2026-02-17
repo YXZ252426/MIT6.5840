@@ -66,10 +66,10 @@ type LogEntry struct{}
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
 	// Your code here (3A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm, rf.state == Leader
 }
 
 func (rf *Raft) upgrade() {
@@ -250,12 +250,82 @@ type AppendEntriesArgs struct {
 
 type AppendEntriesReply struct {
 	Term    int
-	success int
+	success bool
 }
 
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {}
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Term, reply.success = rf.currentTerm, false
+	} else {
+		reply.Term, reply.success = rf.currentTerm, true
+		rf.updateTerm(args.Term)
 
-func (rf *Raft) sendHearbeat() {}
+		select {
+		case rf.HearbeatCh <- Hearbeat{}:
+		default:
+		}
+	}
+}
+
+func (rf *Raft) sendHearbeat() {
+	respondCh := make(chan bool, len(rf.peers)-1)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.mu.Lock()
+		args := AppendEntriesArgs{
+			Term:     rf.currentTerm,
+			LeaderId: rf.me,
+		}
+		rf.mu.Unlock()
+
+		go func(server int) {
+			reply := AppendEntriesReply{}
+			ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
+			if ok && !reply.success {
+				rf.mu.Lock()
+				rf.updateTerm(reply.Term)
+				rf.mu.Unlock()
+			}
+			respondCh <- ok
+		}(i)
+	}
+
+	go func() {
+		successCount := 1
+		timeout := time.After(HeartbeatInterval)
+		for i := 0; i < len(rf.peers)-1; i++ {
+			select {
+			case ok := <-respondCh:
+				if ok {
+					successCount++
+				}
+			case <-timeout:
+				if successCount < len(rf.peers)/2 {
+					rf.mu.Lock()
+					if rf.state == Leader {
+						rf.state = Follower
+						DPrintf("Leader %v stepping down - unable to reach majority", rf.me)
+					}
+					rf.mu.Unlock()
+				}
+				return
+			}
+		}
+
+		if successCount <= len(rf.peers)/2 {
+			rf.mu.Lock()
+			if rf.state == Leader {
+				rf.state = Follower
+				DPrintf("Leader %v stepping down - unable to reach majority", rf.me)
+			}
+			rf.mu.Unlock()
+		}
+	}()
+}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -393,7 +463,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
-
+	rf.HearbeatCh = make(chan Hearbeat)
+	rf.votedFor = -1
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
