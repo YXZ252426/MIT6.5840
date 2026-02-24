@@ -187,16 +187,16 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.updateTerm(args.Term)
-	reply.Term = rf.currentTerm
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.votedFor == -1 {
+	if rf.votedFor == -1 && args.Term >= rf.currentTerm {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 	} else {
 		reply.VoteGranted = false
 	}
+	reply.Term = rf.currentTerm
 	DPrintf("%v vote %v: %v %v %v", rf.me, args.CandidateId, args.Term, rf.currentTerm, reply.VoteGranted)
 }
 
@@ -251,12 +251,12 @@ func (rf *Raft) sendRequestVote(ch chan RequestVoteReply) {
 }
 
 type AppendEntriesArgs struct {
-	Term          int
-	LeaderId      int
-	PrevLogIndex  int
-	PrevLogTerm   int
-	Entries       []LogEntry
-	LeaderaCommit int
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
@@ -265,13 +265,13 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.updateTerm(args.Term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
 		reply.Term, reply.Success = rf.currentTerm, false
 	} else {
 		reply.Term, reply.Success = rf.currentTerm, true
-		rf.updateTerm(args.Term)
 		rf.HearbeatCh <- Hearbeat{}
 	}
 }
@@ -313,7 +313,7 @@ func (rf *Raft) sendHeartbeat() {
 	go func() {
 		wg.Wait()
 
-		if int(atomic.LoadInt32(&successCount)) <= len(rf.peers) {
+		if int(atomic.LoadInt32(&successCount)) <= len(rf.peers)/2 {
 			DPrintf("Leader %v stepping down - unable to reach majority", rf.me)
 			rf.downgrade(2)
 		}
@@ -385,6 +385,8 @@ func (rf *Raft) startElection() {
 				}
 			} else {
 				rf.updateTerm(reply.Term)
+				//不应该拒票就直接降级，有问题！！
+				rf.downgrade(1)
 				DPrintf("Election failed: Downgrade! %v", rf.me)
 				return
 			}
