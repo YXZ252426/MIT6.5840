@@ -31,8 +31,10 @@ const (
 	Leader
 )
 
-const HeartbeatInterval = 100 * time.Millisecond
-const ElectionInterval = 5 * time.Second
+const (
+	HeartbeatInterval = 100 * time.Millisecond
+	ElectionInterval  = 5 * time.Second
+)
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -73,18 +75,24 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 func (rf *Raft) upgrade() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.state < 2 {
 		rf.state += 1
 	}
 }
 
 func (rf *Raft) downgrade(level RaftState) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.state > 0 {
 		rf.state -= level
 	}
 }
 
 func (rf *Raft) updateTerm(newTerm int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if newTerm > rf.currentTerm {
 		rf.currentTerm = newTerm
 		rf.votedFor = -1
@@ -178,11 +186,11 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	rf.updateTerm(args.Term)
 	reply.Term = rf.currentTerm
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.votedFor == -1 {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
@@ -220,18 +228,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(ch chan RequestVoteReply) {
+	rf.mu.Lock()
+	term := rf.currentTerm
+	rf.mu.Unlock()
+
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
 
 		go func(server int) {
-			rf.mu.Lock()
 			args := RequestVoteArgs{
-				Term:        rf.currentTerm,
+				Term:        term,
 				CandidateId: rf.me,
 			}
-			rf.mu.Unlock()
 			reply := RequestVoteReply{}
 			rf.peers[server].Call("Raft.RequestVote", &args, &reply)
 			ch <- reply
@@ -262,68 +272,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		reply.Term, reply.Success = rf.currentTerm, true
 		rf.updateTerm(args.Term)
-
-		select {
-		case rf.HearbeatCh <- Hearbeat{}:
-		default:
-		}
+		rf.HearbeatCh <- Hearbeat{}
 	}
 }
 
 func (rf *Raft) sendHeartbeat() {
-	respondCh := make(chan bool, len(rf.peers)-1)
+	DPrintf("%v sendHeartbeat", rf.me)
+	rf.mu.Lock()
+	term := rf.currentTerm
+	rf.mu.Unlock()
+
+	args := AppendEntriesArgs{
+		Term:     term,
+		LeaderId: rf.me,
+	}
+
+	var wg sync.WaitGroup
+	successCount := int32(1)
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		rf.mu.Lock()
-		args := AppendEntriesArgs{
-			Term:     rf.currentTerm,
-			LeaderId: rf.me,
-		}
-		rf.mu.Unlock()
 
+		wg.Add(1)
 		go func(server int) {
+			defer wg.Done()
+
 			reply := AppendEntriesReply{}
-			ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
-			if ok && !reply.Success {
-				rf.mu.Lock()
-				rf.updateTerm(reply.Term)
-				rf.mu.Unlock()
+
+			if rf.peers[server].Call("Raft.AppendEntries", &args, &reply) {
+				atomic.AddInt32(&successCount, 1)
+
+				if !reply.Success {
+					rf.updateTerm(reply.Term)
+				}
 			}
-			respondCh <- ok
 		}(i)
 	}
 
 	go func() {
-		successCount := 1
-		timeout := time.After(HeartbeatInterval)
-		for i := 0; i < len(rf.peers)-1; i++ {
-			select {
-			case ok := <-respondCh:
-				if ok {
-					successCount++
-				}
-			case <-timeout:
-				if successCount < len(rf.peers)/2 {
-					rf.mu.Lock()
-					if rf.state == Leader {
-						rf.state = Follower
-						DPrintf("Leader %v stepping down - unable to reach majority", rf.me)
-					}
-					rf.mu.Unlock()
-				}
-				return
-			}
-		}
+		wg.Wait()
 
-		if successCount <= len(rf.peers)/2 {
-			rf.mu.Lock()
-			if rf.state == Leader {
-				rf.state = Follower
-				DPrintf("Leader %v stepping down - unable to reach majority", rf.me)
-			}
-			rf.mu.Unlock()
+		if int(atomic.LoadInt32(&successCount)) <= len(rf.peers) {
+			DPrintf("Leader %v stepping down - unable to reach majority", rf.me)
+			rf.downgrade(2)
 		}
 	}()
 }
@@ -371,40 +363,32 @@ func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
-	rf.upgrade()
 	rf.mu.Unlock()
+	rf.upgrade()
 
 	voteCh := make(chan RequestVoteReply)
 	rf.sendRequestVote(voteCh)
 
 	timer := time.After(ElectionInterval)
-	response := 0
+	response := 1
 	vote := 1
 	for response < len(rf.peers)-1 {
 		select {
 		case reply := <-voteCh:
-			rf.mu.Lock()
-
 			response++
 			if reply.VoteGranted {
 				vote++
 				if vote > len(rf.peers)/2 {
 					DPrintf("%v become Leader!", rf.me)
 					rf.upgrade()
-					rf.mu.Unlock()
 					return
 				}
-				rf.mu.Unlock()
 			} else {
 				rf.updateTerm(reply.Term)
-				rf.mu.Unlock()
 				DPrintf("Election failed: Downgrade! %v", rf.me)
 				return
 			}
 		case <-rf.HearbeatCh:
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-
 			rf.downgrade(1)
 			DPrintf("Election failed: Leader exists %v", rf.me)
 			return
@@ -415,6 +399,8 @@ func (rf *Raft) startElection() {
 
 		}
 	}
+	DPrintf("Election failed: Insufficient votes! %v", rf.me)
+	rf.startElection()
 }
 
 func (rf *Raft) getTimeout() time.Duration {
