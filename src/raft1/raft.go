@@ -66,13 +66,6 @@ type LogEntry struct {
 	Index   int
 }
 
-func (rf *Raft) safeGet(index int) int {
-	if index >= 0 && index < len(rf.log) {
-		return rf.log[index].Term
-	}
-	return 0
-}
-
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -108,6 +101,7 @@ func (rf *Raft) toLeader() {
 		rf.nextIndex[i] = index
 		rf.matchIndex[i] = 0
 	}
+	rf.appendBroadcast(false)
 }
 
 func (rf *Raft) checkTerm(term int) bool {
@@ -123,6 +117,7 @@ func (rf *Raft) updateTerm(newTerm int) bool {
 		rf.currentTerm = newTerm
 		rf.votedFor = -1
 		rf.state = Follower
+		DPrintf("%v Term update %v", rf.me, newTerm)
 		return true
 	}
 	return false
@@ -312,6 +307,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
+		DPrintf("args.Term %v < rf.currentTerm %v", args.Term, rf.currentTerm)
 		reply.Term, reply.Success = rf.currentTerm, false
 		return
 	}
@@ -319,6 +315,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term, reply.Success = rf.currentTerm, false
 		return
 	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		DPrintf("rf.log[args.PrevLogIndex].Term %v != args.PrevLogTerm %v", rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
 		reply.Term, reply.Success = rf.currentTerm, false
 		return
 	}
@@ -500,25 +497,21 @@ func (rf *Raft) startElection() {
 				if vote > len(rf.peers)/2 {
 					DPrintf("%v become Leader!", rf.me)
 					rf.toLeader()
-					rf.appendBroadcast(false)
 					return
 				}
 			}
 		case <-timer:
 			DPrintf("Election failed: TimeOut! %v", rf.me)
-			//这对吗？？
 			rf.downgrade(1)
-			rf.startElection()
-
+			return
 		}
 	}
 	DPrintf("Election failed: Insufficient votes! %v", rf.me)
 	rf.downgrade(1)
-	rf.startElection()
 }
 
 func (rf *Raft) getTimeout() time.Duration {
-	ms := 600 + (rand.Int63() % 300)
+	ms := 600 + (rand.Int63() % 600)
 	return time.Duration(ms) * time.Millisecond
 }
 func (rf *Raft) ticker() {
