@@ -86,3 +86,49 @@ lastLogTerm := rf.lastLog().Term
   所以 Kill() 里 resetTimer 的作用是“制造一次未来事件”，保证 ticker 最终从 <-timer.C 醒来，再看到 dead 退出。
 
   你说“原本唤醒时间必然 <= reset 后唤醒时间”不总对，只有在“原 timer 确实还会触发”的情况下才可能比较。
+
+  ### 3.2
+   假设当前 leader 的 rf.log 里只保留了这些日志（前面的被 snapshot 掉了）：
+
+  - 绝对日志下标：100,101,102,103,104,105
+  - 所以 len(rf.log)=6
+  - rf.firstLog().Index = 100
+
+  某个 follower 的 nextIndex[server] = 103，表示它下一条想要的是绝对下标 103。
+
+  旧写法（不 rebase）：
+
+  - prevIndex := 102
+  - prevTerm := rf.log[102].Term  // 把绝对下标当切片下标，直接越界
+  - if rf.nextIndex[server] < len(rf.log) -> 103 < 6 为假，entries 也不会发
+
+  新写法（rebase）：
+
+  - rebaseIndex(102) = 2，所以 prevTerm = rf.log[2].Term（正确，对应绝对下标 102）
+  - rebaseIndex(103) = 3，所以 entries = rf.log[3:]（对应绝对下标 103,104,105，正确）
+
+  所以这个函数不是“仅保护性”，而是把“Raft 绝对下标”映射到“本地切片下标”的必要步骤。
+
+  你可以把 Raft 快照理解成一句话：
+
+  “用一张状态机全量照片，替换一大段旧日志。”
+
+  核心机制就 5 步：
+
+  1. 状态机决定可压缩到 index，调用 rf.Snapshot(index, data)。
+  2. Raft 丢弃 [oldFirst..index] 的日志，只保留一个锚点 log[0]={Index:index, Term:...}，再加 index 后面的后缀日志。
+  3. Leader 发现某个 follower 太落后（通常 nextIndex[peer] <= firstLog().Index），就不再发旧日志，改发 InstallSnapshot。
+  4. Follower 收到后安装快照，更新 commitIndex/lastApplied 到 LastIncludedIndex，并把 ApplyMsg{SnapshotValid:true} 发给上层状态机。
+  5. 上层状态机加载快照后，继续只应用 SnapshotIndex 之后的新日志。
+
+  你这套代码里最重要的理解点：
+
+  - nextIndex/commitIndex/lastApplied 是绝对日志下标。
+  - rf.log 是裁剪后的切片，必须用 rebaseIndex 做映射。
+  - rf.log[0] 不是普通命令，是“快照边界锚点”。
+
+  常见坑（你现在已经踩到边缘了）：
+
+  1. 把绝对下标直接当切片下标（必须 rebase）。
+  2. InstallSnapshot 后快照消息和普通日志消息并发发送，顺序可能乱。
+  3. 安装快照时，若本地同 index 的 term 不匹配，应该丢弃后缀（不能盲目保留）。
