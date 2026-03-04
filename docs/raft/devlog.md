@@ -132,3 +132,57 @@ lastLogTerm := rf.lastLog().Term
   1. 把绝对下标直接当切片下标（必须 rebase）。
   2. InstallSnapshot 后快照消息和普通日志消息并发发送，顺序可能乱。
   3. 安装快照时，若本地同 index 的 term 不匹配，应该丢弃后缀（不能盲目保留）。
+
+  ### 3.3
+  refactor(raft): clean code and extract to multi files
+  对于AppendEntries RPC 和appendOnce的理解是重中之重
+  关键是理解当follower收到问题请求时怎么处理以及leader怎么裁剪follower的错误日志
+  首先index，是全局唯一的，term也是全局唯一的，（index， term）组成的二元组具有最终确定性，即当出现相同index却不同term，rpc请求会失败，而且leader会介入裁剪，保证最终一致性
+  而且当前任期的leader具有话语权，即他的日志是正确的（忠诚😭）
+  如果follower具有leader不存在的Term，会直接被裁掉，如果出现Term重合，但是follower有比leader更长的log，那只取leader有的index（再次体现绝对话语权✋😭✋）
+
+  ### 3.4
+  我有一个问题，在现有raft比较完善的框架下，选举出来的leader是得到大部分共识的，假设遇到一个异常情况，一个random的leader被选举出来，那Raft系统是否有这种fault tolerant能力呢
+
+
+• 有，而且这正是 Raft 设计里考虑的核心点之一，但要分情况看。
+
+  1. 如果你说的 “random leader” 是指
+     某个节点因为超时随机先发起选举并赢得多数票，这其实是正常行为。
+     Raft 不要求“最强节点当 leader”，只要求“拿到多数票且日志足够新”。所以这种“随机性”不会破坏一致性。
+  2. Raft 如何兜底
+
+  - majority voting：没有多数票就当不了 leader。
+  - term 机制：出现更高 term，旧 leader 立刻退位。
+  - log up-to-date 检查：候选者日志太旧，多数节点不会投票给它。
+  - commit rule：只有多数复制成功的日志才算提交。
+
+  3. 不能容忍的场景
+     Raft 是 crash fault tolerant，不是 Byzantine 容错。
+     如果“random leader”是因为实现 bug、节点作恶、随意伪造消息（拜占庭行为）导致的，标准 Raft 不能保证安全性，需要 PBFT/HotStuff 这类 BFT 协议。
+
+  所以结论是：
+
+  - 在 Raft 假设内（节点崩溃/重启、网络延迟/分区）它有容错能力；
+  - 超出假设（作恶或协议被破坏）就不保证。
+
+
+› 但是如果一个严重落后的server也偶然成为了leader（虽然在现有的检查下不可能）那他就会造成破坏性影响
+
+
+• 你这个判断是对的。
+
+  如果“严重落后节点当选 leader”真的发生了（即突破了 Raft 的投票新旧日志检查），那就已经超出标准 Raft 的安全前提，可能产生破坏性后果：
+
+  1. 只当选但拿不到多数复制：通常是可恢复的，主要影响可用性（抖动、频繁换主）。
+  2. 当选且拿到多数复制：可能覆盖其他节点日志，甚至导致“已提交语义”被破坏（实现不严谨时尤其危险）。
+
+  所以关键点是：
+  Raft 的容错能力建立在“选举约束一定正确执行”上；一旦这个约束失效，Raft 不再能保证安全。
+
+  工程上通常会再加几层护栏，防这种“理论不可能但实现可能”的问题：
+
+  1. 严格执行 RequestVote 的 lastLogTerm/lastLogIndex 检查 + PreVote。
+  2. 强制 commitIndex 单调递增。
+  3. 禁止截断 <= commitIndex 的日志（最好直接 panic/assert）。
+  4. 关键状态持久化原子化（term/vote/log fsync 次序正确）。
