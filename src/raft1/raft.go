@@ -34,7 +34,7 @@ const (
 	ElectionInterval  = 600 * time.Second
 	RPCTimeout        = 50 * time.Millisecond
 	ElectionTimeout   = 300 * time.Millisecond
-	ElectionJitter    = 600 * time.Millisecond
+	ElectionJitter    = 300 * time.Millisecond
 )
 
 // A Go object implementing a single Raft peer.
@@ -45,8 +45,9 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32
 
-	applyCh   chan raftapi.ApplyMsg // channel to send ApplyMsg messages to the service
-	applyCond *sync.Cond            // Condition variable to signal the applier goroutine
+	applyCh    chan raftapi.ApplyMsg // channel to send ApplyMsg messages to the service
+	applyCond  *sync.Cond            // Condition variable to signal the applier goroutine
+	shutdownch chan struct{}         // Channel to signal shutdwon
 	// Persistent state
 	state       RaftState
 	currentTerm int
@@ -64,6 +65,11 @@ type Raft struct {
 	// Timers
 	electionTimer *time.Timer
 	hearbeatTimer *time.Timer
+
+	// Snapshot state
+	pendingSnapshot      []byte
+	pendingSnapshotIndex int
+	pendingSnapshotTerm  int
 }
 
 // return currentTerm and whether this server
@@ -106,6 +112,8 @@ func (rf *Raft) toFollower() {
 	rf.resetTimer(rf.electionTimer)
 }
 
+// updateTerm is a helper function used to both check if `Term` has been updated
+// and to implement the update logic
 func (rf *Raft) updateTerm(newTerm int) bool {
 	if newTerm > rf.currentTerm {
 		rf.logf("Discovered a newer term %d (our term is %d). Transitioning to Follower.", newTerm, rf.currentTerm)
@@ -146,11 +154,31 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 // applier is a long-running goroutine that applies committed log entries to the state machine.
 func (rf *Raft) applier() {
+	defer close(rf.applyCh)
 	for !rf.killed() {
 		rf.mu.Lock()
-		for rf.lastApplied >= rf.commitIndex {
+		for rf.lastApplied >= rf.commitIndex && rf.pendingSnapshot == nil && !rf.killed() {
 			rf.applyCond.Wait()
 		}
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+
+		if rf.pendingSnapshot != nil {
+			snapshot := rf.pendingSnapshot
+			rf.pendingSnapshot = nil
+			rf.mu.Unlock()
+
+			rf.applyCh <- raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      snapshot,
+				SnapshotTerm:  rf.pendingSnapshotTerm,
+				SnapshotIndex: rf.pendingSnapshotIndex,
+			}
+			continue
+		}
+
 		commitIndex := rf.commitIndex
 		commit, _ := rf.rebase(commitIndex)
 		applied, _ := rf.rebase(rf.lastApplied)
@@ -237,18 +265,20 @@ func (rf *Raft) ticker() {
 				rf.resetTimer(rf.hearbeatTimer)
 			}
 			rf.mu.Unlock()
+		case <-rf.shutdownch:
+			return
 		}
 	}
 }
 
 // Kill stops this Raft peer.
 func (rf *Raft) Kill() {
+	// Indicate that the peer is dead
 	atomic.StoreInt32(&rf.dead, 1)
-	rf.resetTimer(rf.electionTimer)
-	rf.resetTimer(rf.hearbeatTimer)
-	rf.mu.Lock()
+	// kill ticker
+	close(rf.shutdownch)
+	// kill applier
 	rf.applyCond.Broadcast()
-	rf.mu.Unlock()
 }
 
 // Killed checks if this Raft peer has been killed
@@ -272,6 +302,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		nextIndex:   make([]int, len(peers)),
 		matchIndex:  make([]int, len(peers)),
 		applyCh:     applyCh,
+		shutdownch:  make(chan struct{}),
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
 	// dummy log entry at index 0

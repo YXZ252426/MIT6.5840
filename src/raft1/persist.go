@@ -38,7 +38,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
 		d.Decode(&log) != nil {
-		DPrintf("readPersist failed\n")
+		panic("readPersist failed\n")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor

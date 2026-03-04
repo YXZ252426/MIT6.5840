@@ -4,8 +4,6 @@ package raft
 
 import (
 	"slices"
-
-	"6.5840/raftapi"
 )
 
 // Snapshot tells Raft that it has created a snapshot up to and including index.
@@ -84,12 +82,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.commitIndex = args.LastIncludedIndex
 	rf.persist(args.Data)
 
-	go func() {
-		rf.applyCh <- raftapi.ApplyMsg{
-			SnapshotValid: true,
-			Snapshot:      args.Data,
-			SnapshotTerm:  args.LastIncludedTerm,
-			SnapshotIndex: args.LastIncludedIndex,
-		}
-	}()
+	// Delay the snapshot sending to avoid msg disorder
+	rf.pendingSnapshot = args.Data
+	rf.pendingSnapshotIndex = args.LastIncludedIndex
+	rf.pendingSnapshotTerm = args.LastIncludedTerm
+	rf.applyCond.Broadcast()
 }
