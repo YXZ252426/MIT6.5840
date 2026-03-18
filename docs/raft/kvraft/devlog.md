@@ -1,0 +1,12 @@
+## 26.3.18
+first glance of rsm.go
+
+the whole chain from appendEntries raft.go to rsm.go server.go
+
+distinguish the real disk data(persist data) change and the logically state change
+
+the state change of raft kernel and the state change of upper level rsm
+
+rsm.go, server.go act as a `gateway`!! a `frontend`!!, a little bit like syscall? accept the request from client and invoke raft function?
+
+from now on, the raft kernel is a white box, a kernel, client call put, server wrap submit in it, and submit wait kernel for result

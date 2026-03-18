@@ -186,3 +186,72 @@ lastLogTerm := rf.lastLog().Term
   2. 强制 commitIndex 单调递增。
   3. 禁止截断 <= commitIndex 的日志（最好直接 panic/assert）。
   4. 关键状态持久化原子化（term/vote/log fsync 次序正确）。
+
+## 3.18
+branch conflict resolve
+
+就这两个分支：
+
+  lastIndex := rf.findLastIndexOfTerm(reply.XTerm)
+  if lastIndex == -1 {
+      rf.nextIndex[server] = reply.XIndex
+  } else {
+      rf.nextIndex[server] = lastIndex + 1
+  }
+
+  含义是：follower 返回了一个冲突 term reply.XTerm，leader 看看自己有没有这个 term。
+
+  分支 1：lastIndex == -1
+  leader 里根本没有 reply.XTerm，就直接跳到 follower 这个冲突 term 的起点 reply.XIndex。
+
+  例子：
+
+  - follower 日志：1:1 2:1 3:4 4:4 5:4
+  - leader 日志：1:1 2:1 3:2 4:2 5:3
+
+  这时 follower 返回：
+
+  - XTerm = 4
+  - XIndex = 3
+
+  因为 leader 里根本没有 term 4：
+
+  findLastIndexOfTerm(4) == -1
+
+  所以：
+
+  nextIndex = 3
+
+  意思是 leader 下次直接从 index 3 开始覆盖 follower 那段 term 4 的日志。
+
+  ———
+
+  分支 2：lastIndex != -1
+  leader 里也有 reply.XTerm，那就跳到 leader 中这个 term 最后一次出现的位置后面。
+
+  例子：
+
+  - follower 日志：1:1 2:1 3:2 4:2 5:2 6:5
+  - leader 日志：1:1 2:1 3:2 4:2 5:2 6:3 7:3
+
+  这时 follower 返回：
+
+  - XTerm = 2
+  - XIndex = 3
+
+  leader 查自己：
+
+  findLastIndexOfTerm(2) == 5
+
+  所以：
+
+  nextIndex = 5 + 1 = 6
+
+  意思是：term 2 这一段两边其实能对上，leader 不用退回到 3，直接从 6 开始继续发就行。
+
+  一句话总结：
+
+  - lastIndex == -1：leader 没这个 term，nextIndex = XIndex
+  - lastIndex != -1：leader 有这个 term，nextIndex = lastIndex + 1
+
+  如果你要，我可以继续把这两个例子画成 AppendEntries(prevLogIndex, prevLogTerm) 的完整冲突过程。
