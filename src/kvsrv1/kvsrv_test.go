@@ -1,7 +1,8 @@
 package kvsrv
 
 import (
-	//"log"
+	// "log"
+	"runtime"
 	"testing"
 	"time"
 
@@ -69,7 +70,7 @@ func TestPutConcurrentReliable(t *testing.T) {
 // Check if memory used on server is reasonable
 func TestMemPutManyClientsReliable(t *testing.T) {
 	const (
-		NCLIENT = 20_000
+		NCLIENT = 100_000
 		MEM     = 1000
 	)
 
@@ -95,7 +96,12 @@ func TestMemPutManyClientsReliable(t *testing.T) {
 	// allow threads started by labrpc to start
 	time.Sleep(1 * time.Second)
 
-	m0 := ts.Config.Group(0).MemSize()
+	runtime.GC()
+	runtime.GC()
+
+	var st runtime.MemStats
+	runtime.ReadMemStats(&st)
+	m0 := st.HeapAlloc
 
 	for i := 0; i < NCLIENT; i++ {
 		if err := cks[i].Put("k", v, rpc.Tversion(i)); err != rpc.OK {
@@ -103,10 +109,15 @@ func TestMemPutManyClientsReliable(t *testing.T) {
 		}
 	}
 
-	m1 := ts.Config.Group(0).MemSize()
+	runtime.GC()
+	time.Sleep(1 * time.Second)
+	runtime.GC()
+
+	runtime.ReadMemStats(&st)
+	m1 := st.HeapAlloc
 	f := (float64(m1) - float64(m0)) / NCLIENT
-	if m1 > m0+(NCLIENT*10) {
-		t.Fatalf("error: server using too much memory %d %d (%.2f byte per client)\n", m0, m1, f)
+	if m1 > m0+(NCLIENT*200) {
+		t.Fatalf("error: server using too much memory %d %d (%.2f per client)\n", m0, m1, f)
 	}
 }
 

@@ -10,18 +10,13 @@ import (
 type Clerk struct {
 	clnt    *tester.Clnt
 	servers []string
-	leader int // last successful leader (index into servers[])
-	// You can add to this struct.
+	// You will have to modify this struct.
 }
 
 func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 	ck := &Clerk{clnt: clnt, servers: servers}
 	// You'll have to add code here.
 	return ck
-}
-
-func (ck *Clerk) Leader() int {
-	return ck.leader
 }
 
 // Get fetches the current value and version for a key.  It returns

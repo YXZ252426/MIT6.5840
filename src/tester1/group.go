@@ -1,7 +1,7 @@
 package tester
 
 import (
-	"log"
+	//"log"
 	"strconv"
 	"sync"
 
@@ -9,6 +9,15 @@ import (
 )
 
 type Tgid int
+
+// A service must support Kill(); the tester will Kill()
+// on service returned by FstartServer()
+type IService interface {
+	Kill()
+}
+
+// Start server and return the services to register with labrpc
+type FstartServer func(ends []*labrpc.ClientEnd, grp Tgid, srv int, persister *Persister) []IService
 
 // Each server has a name: i'th server of group gid. If there is only a single
 // server, it its gid = 0 and its i is 0.
@@ -19,23 +28,20 @@ func ServerName(gid Tgid, i int) string {
 // The tester may have many groups of servers (e.g., one per Raft group).
 // Groups are named 0, 1, and so on.
 type Groups struct {
-	mu      sync.Mutex
-	net     *labrpc.Network
-	prog    string
-	args    []string
-	endName string
-	grps    map[Tgid]*ServerGrp
+	mu   sync.Mutex
+	net  *labrpc.Network
+	grps map[Tgid]*ServerGrp
 }
 
-func newGroups(net *labrpc.Network, prog string, args []string, endName string) *Groups {
-	return &Groups{net: net, prog: prog, args: args, endName: endName, grps: make(map[Tgid]*ServerGrp)}
+func newGroups(net *labrpc.Network) *Groups {
+	return &Groups{net: net, grps: make(map[Tgid]*ServerGrp)}
 }
 
-func (gs *Groups) MakeGroup(prog string, args []string, gid Tgid, nsrv int) {
+func (gs *Groups) MakeGroup(gid Tgid, nsrv int, mks FstartServer) {
 	gs.mu.Lock()
 	defer gs.mu.Unlock()
 
-	gs.grps[gid] = makeSrvGrp(gs.net, prog, args, gs.endName, gid, nsrv)
+	gs.grps[gid] = makeSrvGrp(gs.net, gid, nsrv, mks)
 }
 
 func (gs *Groups) lookupGroup(gid Tgid) *ServerGrp {
@@ -57,31 +63,27 @@ func (gs *Groups) cleanup() {
 	defer gs.mu.Unlock()
 
 	for _, sg := range gs.grps {
-		sg.Shutdown()
+		sg.cleanup()
 	}
 }
 
 type ServerGrp struct {
 	net         *labrpc.Network
-	prog        string
-	args        []string
 	srvs        []*Server
 	servernames []string
-	endName     string
 	gid         Tgid
 	connected   []bool // whether each server is on the net
+	mks         FstartServer
 	mu          sync.Mutex
 }
 
-func makeSrvGrp(net *labrpc.Network, prog string, args []string, endName string, gid Tgid, n int) *ServerGrp {
+func makeSrvGrp(net *labrpc.Network, gid Tgid, n int, mks FstartServer) *ServerGrp {
 	sg := &ServerGrp{
 		net:       net,
-		prog:      prog,
-		args:      args,
-		endName:   endName,
 		srvs:      make([]*Server, n),
 		gid:       gid,
 		connected: make([]bool, n),
+		mks:       mks,
 	}
 	for i, _ := range sg.srvs {
 		sg.srvs[i] = makeServer(net, gid, n)
@@ -103,6 +105,14 @@ func (sg *ServerGrp) SrvNames() []string {
 
 func (sg *ServerGrp) SrvName(i int) string {
 	return sg.servernames[i]
+}
+
+func (sg *ServerGrp) Services() [][]IService {
+	ss := make([][]IService, 0, len(sg.srvs))
+	for _, s := range sg.srvs {
+		ss = append(ss, s.svcs)
+	}
+	return ss
 }
 
 func (sg *ServerGrp) SrvNamesTo(to []int) []string {
@@ -131,9 +141,13 @@ func (sg *ServerGrp) ConnectOne(i int) {
 	sg.connect(i, sg.all())
 }
 
-func (sg *ServerGrp) Kill(srvs []int) {
-	for _, srv := range srvs {
-		sg.ShutdownServer(srv)
+func (sg *ServerGrp) cleanup() {
+	for _, s := range sg.srvs {
+		if s.svcs != nil {
+			for _, svc := range s.svcs {
+				svc.Kill()
+			}
+		}
 	}
 }
 
@@ -159,16 +173,16 @@ func (sg *ServerGrp) connect(i int, to []int) {
 // detach server from the servers listed in from
 // caller must hold cfg.mu
 func (sg *ServerGrp) disconnect(i int, from []int) {
-	//log.Printf("%p: disconnect peer %d from %v", sg, i, from)
+	// log.Printf("%p: disconnect peer %d from %v\n", sg, i, from)
 
 	sg.mu.Lock()
 	sg.connected[i] = false
 	sg.mu.Unlock()
 
-	// outgoing ends
+	// outgoing socket files
 	sg.srvs[i].disconnect(from)
 
-	// incoming ends
+	// incoming socket files
 	for j := 0; j < len(from); j++ {
 		s := sg.srvs[from[j]]
 		if s.endNames != nil {
@@ -193,22 +207,11 @@ func (sg *ServerGrp) GetConnected() []bool {
 	return sg.connected
 }
 
-func (sg *ServerGrp) MemSize() uint64 {
-	memsize := uint64(0)
-	for _, s := range sg.srvs {
-		n := s.memSize()
-		if n > memsize {
-			memsize = n
-		}
-	}
-	return memsize
-}
-
-// Maximum raft state size across all servers
-func (sg *ServerGrp) RaftSize() int {
+// Maximum log size across all servers
+func (sg *ServerGrp) LogSize() int {
 	logsize := 0
 	for _, s := range sg.srvs {
-		n := s.raftSize()
+		n := s.saved.RaftStateSize()
 		if n > logsize {
 			logsize = n
 		}
@@ -220,7 +223,7 @@ func (sg *ServerGrp) RaftSize() int {
 func (sg *ServerGrp) SnapshotSize() int {
 	snapshotsize := 0
 	for _, s := range sg.srvs {
-		n := s.snapshotSize()
+		n := s.saved.SnapshotSize()
 		if n > snapshotsize {
 			snapshotsize = n
 		}
@@ -229,39 +232,22 @@ func (sg *ServerGrp) SnapshotSize() int {
 }
 
 // If restart servers, first call shutdownserver
-func (sg *ServerGrp) StartServer(i int) error {
+func (sg *ServerGrp) StartServer(i int) {
 	srv := sg.srvs[i].startServer(sg.gid)
 	sg.srvs[i] = srv
 
-	//log.Printf("StartServer %d %v %q", i, srv.endNames, sg.prog)
-
+	srv.svcs = sg.mks(srv.clntEnds, sg.gid, i, srv.saved)
 	labsrv := labrpc.MakeServer()
-
-	// start a process to run server
-	dc, err := runDaemon(sg.net, sg.prog, sg.args, sg.endName, sg.gid, i, srv.endNames)
-	if err != nil {
-		log.Printf("runDaemon err %v", err)
-		return err
+	for _, svc := range srv.svcs {
+		s := labrpc.MakeService(svc)
+		labsrv.AddService(s)
 	}
-	srv.dc = dc
-
-	// send the save persistor state to server
-	dc.init(srv.saved)
-	dc.waitInit()
-
-	// now add server to network
-	labsrv.SetDispatch(dc.forward)
 	sg.net.AddServer(ServerName(sg.gid, i), labsrv)
-	return nil
-}
-
-func (sg *ServerGrp) DaemonClnt(i int) *DaemonClnt {
-	return sg.srvs[i].dc
 }
 
 // create a full set of KV servers.
 func (sg *ServerGrp) StartServers() {
-	sg.StartSrvs(sg.all())
+	sg.start()
 	sg.ConnectAll()
 }
 
@@ -271,22 +257,25 @@ func (sg *ServerGrp) ShutdownServer(i int) {
 	sg.disconnect(i, sg.all())
 
 	// disable client connections to the server.
+	// it's important to do this before creating
+	// the new Persister in saved[i], to avoid
+	// the possibility of the server returning a
+	// positive reply to an Append but persisting
+	// the result in the superseded Persister.
 	sg.net.DeleteServer(ServerName(sg.gid, i))
 
 	sg.srvs[i].shutdownServer()
 }
 
-func (sg *ServerGrp) Servers() []int {
-	return sg.all()
-}
-
 func (sg *ServerGrp) Shutdown() {
-	sg.Kill(sg.all())
+	for i, _ := range sg.srvs {
+		sg.ShutdownServer(i)
+	}
 }
 
-func (sg *ServerGrp) StartSrvs(srvs []int) {
-	for _, srv := range srvs {
-		sg.StartServer(srv)
+func (sg *ServerGrp) start() {
+	for i, _ := range sg.srvs {
+		sg.StartServer(i)
 	}
 }
 

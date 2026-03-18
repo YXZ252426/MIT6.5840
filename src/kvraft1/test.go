@@ -1,16 +1,11 @@
 package kvraft
 
 import (
-	"fmt"
-	"sync"
 	"testing"
 
 	"6.5840/kvtest1"
+	"6.5840/labrpc"
 	"6.5840/tester1"
-)
-
-const (
-	Gid = tester.GRP0
 )
 
 type Test struct {
@@ -23,9 +18,9 @@ type Test struct {
 	partitions   bool
 	maxraftstate int
 	randomkeys   bool
-
-	mu sync.Mutex
 }
+
+const Gid = tester.GRP0
 
 func MakeTest(t *testing.T, part string, nclients, nservers int, reliable bool, crash bool, partitions bool, maxraftstate int, randomkeys bool) *Test {
 	ts := &Test{
@@ -38,27 +33,21 @@ func MakeTest(t *testing.T, part string, nclients, nservers int, reliable bool, 
 		maxraftstate: maxraftstate,
 		randomkeys:   randomkeys,
 	}
-	args := []string{fmt.Sprintf("--max-raft-state=%d", maxraftstate)}
-	cfg := tester.MakeConfig(t, nservers, reliable, "kvraft1d", args)
+	cfg := tester.MakeConfig(t, nservers, reliable, ts.StartKVServer)
 	ts.Test = kvtest.MakeTest(t, cfg, randomkeys, ts)
 	ts.Begin(ts.makeTitle())
 	return ts
 }
 
-func (ts *Test) killall() {
-	ts.Group(Gid).Shutdown()
-	tester.AnnotateShutdownAll()
-}
+func (ts *Test) StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persister *tester.Persister) []tester.IService {
+	return StartKVServer(servers, gid, me, persister, ts.maxraftstate)
 
-func (ts *Test) restartall() {
-	ts.Group(Gid).StartServers()
-	tester.AnnotateRestartAll()
 }
 
 func (ts *Test) MakeClerk() kvtest.IKVClerk {
 	clnt := ts.Config.MakeClient()
 	ck := MakeClerk(clnt, ts.Group(Gid).SrvNames())
-	return &kvtest.TestClerk{ck, clnt, ts.Config}
+	return &kvtest.TestClerk{ck, clnt}
 }
 
 func (ts *Test) DeleteClerk(ck kvtest.IKVClerk) {
@@ -70,7 +59,7 @@ func (ts *Test) MakeClerkTo(to []int) kvtest.IKVClerk {
 	ns := ts.Config.Group(Gid).SrvNamesTo(to)
 	clnt := ts.Config.MakeClientTo(ns)
 	ck := MakeClerk(clnt, ts.Group(Gid).SrvNames())
-	return &kvtest.TestClerk{ck, clnt, ts.Config}
+	return &kvtest.TestClerk{ck, clnt}
 }
 
 func (ts *Test) cleanup() {

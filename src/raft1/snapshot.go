@@ -33,7 +33,7 @@ func (rf *Raft) sendInstallSnapshot(server int) {
 	}
 	args := InstallSnapshotArgs{
 		Term:              rf.currentTerm,
-		LeaderId:          rf.me,
+		LeaderID:          rf.me,
 		LastIncludedIndex: rf.firstLog().Index,
 		LastIncludedTerm:  rf.firstLog().Term,
 		Data:              rf.persister.ReadSnapshot(),
@@ -77,7 +77,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		idx, _ := rf.rebase(args.LastIncludedIndex)
 		rf.log = rf.log[idx:]
 	}
-	rf.log[0].Index, rf.log[0].Term = args.LastIncludedIndex, args.LastIncludedTerm
+	rf.log[0].Index, rf.log[0].Term, rf.log[0].Command = args.LastIncludedIndex, args.LastIncludedTerm, nil
 	rf.lastApplied = args.LastIncludedIndex
 	rf.commitIndex = args.LastIncludedIndex
 	rf.persist(args.Data)

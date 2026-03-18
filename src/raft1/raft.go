@@ -1,10 +1,9 @@
 // Package raft implements the Raft consensus algorithm.
 package raft
 
-// raft.go contains the core Raft peer structure and methods
-import (
-	//	"bytes"
+// raft.go contains the core Raft peer structure and methods.
 
+import (
 	"math/rand"
 	"slices"
 	"sync"
@@ -16,7 +15,7 @@ import (
 	tester "6.5840/tester1"
 )
 
-// RaftState represents the role of a Raft peer
+// RaftState represents the role of a Raft peer.
 type (
 	RaftState int
 )
@@ -28,43 +27,41 @@ const (
 	Leader
 )
 
-// Timing constants
+// Timing constants.
 const (
 	HeartbeatInterval = 100 * time.Millisecond
-	ElectionInterval  = 600 * time.Second
-	RPCTimeout        = 50 * time.Millisecond
 	ElectionTimeout   = 300 * time.Millisecond
 	ElectionJitter    = 300 * time.Millisecond
 )
 
-// A Go object implementing a single Raft peer.
+// Raft is A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *tester.Persister   // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32
-
+	mu         sync.Mutex            // Lock to protect shared access to this peer's state
+	peers      []*labrpc.ClientEnd   // RPC end points of all peers
+	persister  *tester.Persister     // Object to hold this peer's persisted state
+	me         int                   // this peer's index into peers[]
+	dead       int32                 // set by Kill()
 	applyCh    chan raftapi.ApplyMsg // channel to send ApplyMsg messages to the service
 	applyCond  *sync.Cond            // Condition variable to signal the applier goroutine
-	shutdownch chan struct{}         // Channel to signal shutdwon
+	shutdownCh chan struct{}         // Channel to signal shutdown
+
 	// Persistent state
 	state       RaftState
 	currentTerm int
-	votedFor    int
+	VotedFor    int
 	log         []LogEntry
 
-	// Volatile state on all servers
+	//	Volatile state for all servers
 	commitIndex int
 	lastApplied int
 
-	// Volatile stats on leaders
+	// Volatile state for leader
 	nextIndex  []int
 	matchIndex []int
 
 	// Timers
-	electionTimer *time.Timer
-	hearbeatTimer *time.Timer
+	electionTimer  *time.Timer
+	heartbeatTimer *time.Timer
 
 	// Snapshot state
 	pendingSnapshot      []byte
@@ -72,52 +69,52 @@ type Raft struct {
 	pendingSnapshotTerm  int
 }
 
-// return currentTerm and whether this server
+// GetState return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	// Your code here (3A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.currentTerm, rf.state == Leader
 }
+
+// toLeader transitions the server to the Leader state.
 func (rf *Raft) toLeader() {
-	rf.logf("Transitioned to Leader. current logs: %v", rf.log)
+	rf.logf("Transitioned to Leader.")
 	rf.state = Leader
-	last := rf.lastLog().Index
+	idx := rf.lastLog().Index
 	for i := range rf.peers {
-		rf.nextIndex[i] = last + 1
+		rf.nextIndex[i] = idx + 1
 		rf.matchIndex[i] = 0
 	}
-	rf.resetTimer(rf.hearbeatTimer)
+	rf.resetTimer(rf.heartbeatTimer)
 	rf.electionTimer.Stop()
 	rf.appendBroadcast()
 }
 
+// toCandidate transitions the server to the Candidate state.
 func (rf *Raft) toCandidate() {
 	rf.logf("Transitioned to Candidate.")
 	rf.state = Candidate
 	rf.currentTerm += 1
-	rf.votedFor = rf.me
+	rf.VotedFor = rf.me
 	rf.persist(nil)
 }
 
-// toFollower transitions the server to the follower state.
+// toFollower transitions the server to the Follower state.
 func (rf *Raft) toFollower() {
 	if rf.state != Follower {
-		rf.logf("Transitioned to follower")
+		rf.logf("Transitioned to Follower.")
 		rf.state = Follower
-		rf.hearbeatTimer.Stop()
+		rf.heartbeatTimer.Stop()
 	}
 	rf.resetTimer(rf.electionTimer)
 }
 
-// updateTerm is a helper function used to both check if `Term` has been updated
-// and to implement the update logic
+// updateTerm is a helper function used to both check if `Term` has been updated and to implement the update logic.
 func (rf *Raft) updateTerm(newTerm int) bool {
 	if newTerm > rf.currentTerm {
-		rf.logf("Discovered a newer term %d (our term is %d). Transitioning to Follower.", newTerm, rf.currentTerm)
-		rf.currentTerm, rf.votedFor = newTerm, -1
+		rf.logf("Discovered a newer term %d (our term is %d).", newTerm, rf.currentTerm)
+		rf.currentTerm, rf.VotedFor = newTerm, -1
 		rf.toFollower()
 		rf.persist(nil)
 		return true
@@ -125,13 +122,13 @@ func (rf *Raft) updateTerm(newTerm int) bool {
 	return false
 }
 
-// isStatebehind checks if the server's state is behind based on term and state
+// isStateBehind checks if the server's state is behind based on term and state.
 func (rf *Raft) isStateBehind(newTerm int, oldState RaftState, oldTerm int) bool {
 	return rf.updateTerm(newTerm) || rf.state != oldState || rf.currentTerm != oldTerm
 }
 
-// Start initiates the argument on the next command to be appende to the log.
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
+// Start initiates the agreement on the next command to be appended to the log.
+func (rf *Raft) Start(command any) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.state != Leader {
@@ -146,7 +143,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Index:   index,
 	}
 	rf.log = append(rf.log, entry)
-	rf.logf("Leader Appended new entry at index %d, %v", index, entry)
+	rf.logf("Leader Appended new entry at index %d: %v", index, entry)
 	rf.persist(nil)
 	rf.appendBroadcast()
 	return index, term, true
@@ -183,7 +180,7 @@ func (rf *Raft) applier() {
 		commit, _ := rf.rebase(commitIndex)
 		applied, _ := rf.rebase(rf.lastApplied)
 		entries := slices.Clone(rf.log[applied+1 : commit+1])
-		rf.logf("Applying from index %d to %d, entries: %v.", applied, commit, entries)
+		rf.logf("Applying from index %d to %d, entries: %v", applied, commit, entries)
 		rf.mu.Unlock()
 
 		for _, entry := range entries {
@@ -199,17 +196,18 @@ func (rf *Raft) applier() {
 	}
 }
 
-// electionTimeout returns a randomized election timeout duration
+// electionTimeout returns a randomized election timeout duration.
 func (rf *Raft) electionTimeout() time.Duration {
-	return ElectionTimeout + time.Duration(rand.Int63n(int64(ElectionJitter)))
+	timeout := ElectionTimeout + time.Duration(rand.Int63n(int64(ElectionJitter)))
+	return timeout
 }
 
-// heartbeatTimeout return the heartbeat timeout duration.
+// heartbeatTimeout returns the heartbeat timeout duration.
 func (rf *Raft) heartbeatTimeout() time.Duration {
 	return HeartbeatInterval
 }
 
-// wrapper to reset a time safely
+// resetTimer resets a timer safely.
 func (rf *Raft) resetTimer(t *time.Timer) {
 	if !t.Stop() {
 		select {
@@ -220,35 +218,33 @@ func (rf *Raft) resetTimer(t *time.Timer) {
 	switch t {
 	case rf.electionTimer:
 		t.Reset(rf.electionTimeout())
-	case rf.hearbeatTimer:
+	case rf.heartbeatTimer:
 		t.Reset(rf.heartbeatTimeout())
 	default:
-		panic("unknown timer!")
+		panic("unknown timer")
 	}
 }
 
+// appendBroadcast dispatches sendInstallSnapshot or appendOnce to all peers.
 func (rf *Raft) appendBroadcast() {
-	rf.logf("Heartbeat Timer expired, sending heatbeats")
-	for i := range rf.peers {
-		if i == rf.me {
+	for peer := range rf.peers {
+		if peer == rf.me {
 			continue
 		}
-		if rf.nextIndex[i] <= rf.firstLog().Index {
-			rf.logf("Sending InstallSnapshot to peer %d (nextIndex: %d, firstLog: %d).", i, rf.nextIndex[i], rf.firstLog().Index)
-			go rf.sendInstallSnapshot(i)
-		} else {
-			rf.logf("Heartbeat timer expired, sending heartbeats to peer %d.", i)
-			go rf.appendOnce(i)
-		}
 
+		if rf.nextIndex[peer] <= rf.firstLog().Index {
+			// rf.logf("Heartbeat timer expired, sending installsnapshot to peer %d.", peer)
+			go rf.sendInstallSnapshot(peer)
+		} else {
+			// rf.logf("Heartbeat timer expired, sending heartbeats to peer %d.", peer)
+			go rf.appendOnce(peer)
+		}
 	}
 }
 
 // ticker is a long-running goroutine that checks for election timeouts
-// and sends heartbeats if this server is the leader
+// and sends heartbeats if this server is the leader.
 func (rf *Raft) ticker() {
-	// Your code here (3A)
-	// Check if a leader election should be started.
 	for !rf.killed() {
 		select {
 		case <-rf.electionTimer.C:
@@ -258,14 +254,14 @@ func (rf *Raft) ticker() {
 				rf.resetTimer(rf.electionTimer)
 			}
 			rf.mu.Unlock()
-		case <-rf.hearbeatTimer.C:
+		case <-rf.heartbeatTimer.C:
 			rf.mu.Lock()
 			if rf.state == Leader {
 				rf.appendBroadcast()
-				rf.resetTimer(rf.hearbeatTimer)
+				rf.resetTimer(rf.heartbeatTimer)
 			}
 			rf.mu.Unlock()
-		case <-rf.shutdownch:
+		case <-rf.shutdownCh:
 			return
 		}
 	}
@@ -276,37 +272,38 @@ func (rf *Raft) Kill() {
 	// Indicate that the peer is dead
 	atomic.StoreInt32(&rf.dead, 1)
 	// kill ticker
-	close(rf.shutdownch)
+	close(rf.shutdownCh)
 	// kill applier
 	rf.applyCond.Broadcast()
 }
 
-// Killed checks if this Raft peer has been killed
+// killed checks if this Raft peer has been killed.
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
 }
 
-// Make creates a new Raft server
+// Make creates a new Raft server.
 func Make(peers []*labrpc.ClientEnd, me int,
-	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
+	persister *tester.Persister, applyCh chan raftapi.ApplyMsg,
+) raftapi.Raft {
 	// init Raft struct
 	rf := &Raft{
 		peers:       peers,
 		persister:   persister,
 		me:          me,
 		currentTerm: 0,
-		votedFor:    -1,
+		VotedFor:    -1,
 		commitIndex: 0,
 		lastApplied: 0,
 		nextIndex:   make([]int, len(peers)),
 		matchIndex:  make([]int, len(peers)),
 		applyCh:     applyCh,
-		shutdownch:  make(chan struct{}),
+		shutdownCh:  make(chan struct{}),
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
 	// dummy log entry at index 0
-	rf.log = append(rf.log, LogEntry{0, nil, 0})
+	rf.log = append(rf.log, LogEntry{0, 0, nil})
 	for i := range rf.nextIndex {
 		rf.nextIndex[i] = 1
 	}
@@ -314,11 +311,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 	// initialize timers
 	rf.electionTimer = time.NewTimer(rf.electionTimeout())
-	rf.hearbeatTimer = time.NewTimer(rf.heartbeatTimeout())
+	rf.heartbeatTimer = time.NewTimer(rf.heartbeatTimeout())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	// start applier goroutine to app;y committed entries
+	// start applier goroutine to apply committed entries
 	go rf.applier()
 
 	return rf

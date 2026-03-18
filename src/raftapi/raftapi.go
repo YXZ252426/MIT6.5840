@@ -4,7 +4,7 @@ package raftapi
 type Raft interface {
 	// Start agreement on a new log entry, and return the log index
 	// for that entry, the term, and whether the peer is the leader.
-	Start(command interface{}) (int, int, bool)
+	Start(command any) (int, int, bool)
 
 	// Ask a Raft for its current term, and whether it thinks it is
 	// leader
@@ -13,6 +13,10 @@ type Raft interface {
 	// For Snaphots (3D)
 	Snapshot(index int, snapshot []byte)
 	PersistBytes() int
+
+	// For the tester to indicate to your code that is should cleanup
+	// any long-running go routines.
+	Kill()
 }
 
 // As each Raft peer becomes aware that successive log entries are
@@ -20,11 +24,12 @@ type Raft interface {
 // tester), via the applyCh passed to Make(). Set CommandValid to true
 // to indicate that the ApplyMsg contains a newly committed log entry.
 //
-// You'll find the Snapshot fields useful later in the lab.
-// Exactly one of CommandValid and SnapshotValid should be true.
+// In Lab 3 you'll want to send other kinds of messages (e.g.,
+// snapshots) on the applyCh; at that point you can add fields to
+// ApplyMsg, but set CommandValid to false for these other uses.
 type ApplyMsg struct {
 	CommandValid bool
-	Command      interface{}
+	Command      any
 	CommandIndex int
 
 	SnapshotValid bool

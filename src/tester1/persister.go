@@ -27,12 +27,12 @@ func clone(orig []byte) []byte {
 	return x
 }
 
-func (ps *Persister) Checkpoint() *Persister {
+func (ps *Persister) Copy() *Persister {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	np := MakePersister()
-	np.raftstate = clone(ps.raftstate)
-	np.snapshot = clone(ps.snapshot)
+	np.raftstate = ps.raftstate
+	np.snapshot = ps.snapshot
 	return np
 }
 

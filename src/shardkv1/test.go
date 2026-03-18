@@ -9,18 +9,15 @@ import (
 	"testing"
 	"time"
 
+	"6.5840/kvraft1/rsm"
 	"6.5840/kvsrv1"
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
+	"6.5840/labrpc"
 	"6.5840/shardkv1/shardcfg"
 	"6.5840/shardkv1/shardctrler"
+	"6.5840/shardkv1/shardgrp"
 	"6.5840/tester1"
-)
-
-const (
-	Controler     = tester.Tgid(0) // controler uses group 0 for a kvraft group
-	NSRV          = 3              // servers per group
-	INTERGRPDELAY = 200            // time in ms between group changes
 )
 
 type Test struct {
@@ -32,10 +29,15 @@ type Test struct {
 	partition bool
 
 	maxraftstate int
-
-	mu   sync.Mutex
-	ngid tester.Tgid
+	mu           sync.Mutex
+	ngid         tester.Tgid
 }
+
+const (
+	Controler     = tester.Tgid(0) // controler uses group 0 for a kvraft group
+	NSRV          = 3              // servers per group
+	INTERGRPDELAY = 200            // time in ms between group changes
+)
 
 // Setup kvserver for the shard controller and make the controller
 func MakeTestMaxRaft(t *testing.T, part string, reliable, partition bool, maxraftstate int) *Test {
@@ -45,7 +47,7 @@ func MakeTestMaxRaft(t *testing.T, part string, reliable, partition bool, maxraf
 		partition:    partition,
 		maxraftstate: maxraftstate,
 	}
-	cfg := tester.MakeConfig(t, 1, reliable, "kvsrv1d", []string{})
+	cfg := tester.MakeConfig(t, 1, reliable, kvsrv.StartKVServer)
 	ts.Test = kvtest.MakeTest(t, cfg, false, ts)
 	// XXX to avoid panic
 	tester.AnnotateTest(part, 1)
@@ -64,7 +66,7 @@ func MakeTestLeases(t *testing.T, part string, reliable bool) *Test {
 func (ts *Test) MakeClerk() kvtest.IKVClerk {
 	clnt := ts.Config.MakeClient()
 	ck := MakeClerk(clnt, ts.makeShardCtrler())
-	return &kvtest.TestClerk{ck, clnt, ts.Config}
+	return &kvtest.TestClerk{ck, clnt}
 }
 
 func (ts *Test) DeleteClerk(ck kvtest.IKVClerk) {
@@ -109,16 +111,19 @@ func (ts *Test) groups(n int) []tester.Tgid {
 	return grps
 }
 
-// Set up KVService with one group Gid1. Gid1 should initialize itself to
+// Set up KVServervice with one group Gid1. Gid1 should initialize itself to
 // own all shards.
 func (ts *Test) setupKVService() tester.Tgid {
 	ts.sck = ts.makeShardCtrler()
 	scfg := shardcfg.MakeShardConfig()
-	args := []string{fmt.Sprintf("--max-raft-state=%d", ts.maxraftstate)}
-	ts.Config.MakeGroupStart("shardgrp1d", args, shardcfg.Gid1, NSRV)
+	ts.Config.MakeGroupStart(shardcfg.Gid1, NSRV, ts.StartServerShardGrp)
 	scfg.JoinBalance(map[tester.Tgid][]string{shardcfg.Gid1: ts.Group(shardcfg.Gid1).SrvNames()})
 	ts.sck.InitConfig(scfg)
 	return shardcfg.Gid1
+}
+
+func (ts *Test) StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persister *tester.Persister) []tester.IService {
+	return shardgrp.StartServerShardGrp(servers, gid, me, persister, ts.maxraftstate)
 }
 
 func (ts *Test) checkMember(sck *shardctrler.ShardCtrler, gid tester.Tgid) bool {
@@ -140,8 +145,7 @@ func (ts *Test) join(sck *shardctrler.ShardCtrler, gid tester.Tgid, srvs []strin
 
 func (ts *Test) joinGroups(sck *shardctrler.ShardCtrler, gids []tester.Tgid) bool {
 	for _, gid := range gids {
-		args := []string{fmt.Sprintf("--max-raft-state=%d", ts.maxraftstate)}
-		ts.Config.MakeGroupStart("shardgrp1d", args, gid, NSRV)
+		ts.Config.MakeGroupStart(gid, NSRV, ts.StartServerShardGrp)
 		ts.join(sck, gid, ts.Group(gid).SrvNames())
 		if ok := ts.checkMember(sck, gid); !ok {
 			return false
@@ -174,12 +178,11 @@ func (ts *Test) leaveGroups(sck *shardctrler.ShardCtrler, gids []tester.Tgid) bo
 	return true
 }
 
-func (ts *Test) shutdownLeader(ck *kvtest.TestClerk, gid tester.Tgid) int {
-	c, ok := ck.IKVClerk.(*Clerk).GetClerk(gid)
+func (ts *Test) disconnectClntFromLeader(gid tester.Tgid) int {
+	ok, l := rsm.Leader(ts.Config, gid)
 	if !ok {
-		log.Fatalf("shutdownLeader: no shardgrp clerk for %d", gid)
+		log.Fatalf("Leader failed")
 	}
-	l := c.Leader()
 	ts.Group(gid).ShutdownServer(l)
 	return l
 }
@@ -224,7 +227,7 @@ func (ts *Test) checkShutdownSharding(down tester.Tgid, ka []string, va []string
 		}
 	}
 
-	//log.Printf("%d completions out of %d; down %d", ndone, n, down)
+	// log.Printf("%d completions out of %d; down %d", ndone, n, down)
 	if ndone >= n {
 		ts.Fatalf("expected less than %d completions with shard %d down\n", n, down)
 	}
@@ -296,7 +299,7 @@ func (ts *Test) partitionCtrler(ck kvtest.IKVClerk, gid tester.Tgid, ka, va []st
 		time.Sleep(NSEC * time.Second)
 	}
 
-	//log.Printf("startservers")
+	//log.Printf("startservers %v lease expired %t", time.Now().Sub(t), ts.leases)
 
 	ts.Group(gid).StartServers()
 

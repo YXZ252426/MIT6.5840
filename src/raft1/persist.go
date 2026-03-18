@@ -1,6 +1,6 @@
 package raft
 
-// persistent state handing for Raft
+// persistent state handling for Raft.
 
 import (
 	"bytes"
@@ -8,41 +8,42 @@ import (
 	"6.5840/labgob"
 )
 
-// persist saves Raft's persistent state to stable storage
+// persist saves Raft's persistent state to stable storage,
 func (rf *Raft) persist(snapshot []byte) {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
+	e.Encode(rf.VotedFor)
 	e.Encode(rf.log)
-	raftstate := w.Bytes()
+
 	if snapshot == nil {
 		snapshot = rf.persister.ReadSnapshot()
 	}
+	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, snapshot)
 }
 
-// readPersist restore previously persisted state.
+// readPersist restores previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if len(data) < 1 {
 		return
 	}
-
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
 	var currentTerm int
 	var votedFor int
 	var log []LogEntry
-
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
 		d.Decode(&log) != nil {
 		panic("readPersist failed\n")
 	} else {
 		rf.currentTerm = currentTerm
-		rf.votedFor = votedFor
+		rf.VotedFor = votedFor
 		rf.log = log
+		rf.lastApplied = rf.firstLog().Index
+		rf.commitIndex = rf.firstLog().Index
 	}
 }
 

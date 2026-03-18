@@ -1,19 +1,17 @@
 package raft
 
-// RPC argument and reply structures
+// RPC argument and reply structures.
 
 // RequestVoteArgs: the argument structure for RequestVote RPCs.
 type RequestVoteArgs struct {
-	// Your data here (3A, 3B).
 	Term         int
-	CandidateId  int
+	CandidateID  int
 	LastLogIndex int
 	LastLogTerm  int
 }
 
 // RequestVoteReply: the reply structure for RequestVote RPCs.
 type RequestVoteReply struct {
-	// Your data here (3A).
 	Term        int
 	VoteGranted bool
 }
@@ -21,7 +19,7 @@ type RequestVoteReply struct {
 // AppendEntriesArgs: the argument structure for AppendEntries RPCs.
 type AppendEntriesArgs struct {
 	Term         int
-	LeaderId     int
+	LeaderID     int
 	PrevLogIndex int
 	PrevLogTerm  int
 	Entries      []LogEntry
@@ -34,19 +32,19 @@ type AppendEntriesReply struct {
 	Success bool
 	XTerm   int
 	XIndex  int
-	Xlen    int
+	XLen    int
 }
 
-// InstallSnapshotArgs: the arguments structure for InstallSnapshot RPCs.
+// InstallSnapshotArgs: the argument structure for InstallSnapshot RPCs.
 type InstallSnapshotArgs struct {
 	Term              int
-	LeaderId          int
+	LeaderID          int
 	LastIncludedIndex int
 	LastIncludedTerm  int
 	Data              []byte
 }
 
-// InstallSnapshptReply: the reply structure for InstallSnapshot RPCs.
+// InstallSnapshotReply: the reply structure for InstallSnapshot RPCs.
 type InstallSnapshotReply struct {
 	Term int
 }
