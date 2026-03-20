@@ -15,7 +15,7 @@ import (
 const opTimeout = 100 * time.Millisecond
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
-var Unregister struct{}
+var Unregister = struct{}{}
 
 type Op struct {
 	Me  int
@@ -177,7 +177,7 @@ func (rsm *RSM) handleCommand(msg raftapi.ApplyMsg) {
 	result := rsm.sm.DoOp(op.Req)
 
 	rsm.mu.Lock()
-	defer rsm.mu.Lock()
+	defer rsm.mu.Unlock()
 	if waiter, exists := rsm.pendings[msg.CommandIndex]; exists {
 		if waiter.id == op.Id {
 			waiter.notify(result)

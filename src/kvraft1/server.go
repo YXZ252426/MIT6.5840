@@ -177,7 +177,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	labgob.Register(Entry{})
 	labgob.Register(map[string]Entry{})
 	labgob.Register(map[int64]CacheEntry{})
-	labgob.Register(&CacheEntry{})
+	labgob.Register(CacheEntry{})
 
 	kv := &KVServer{
 		me:     me,

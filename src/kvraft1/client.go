@@ -1,7 +1,7 @@
 package kvraft
 
 import (
-	"math/rand/v2"
+	"math/rand"
 	"sync/atomic"
 	"time"
 
@@ -24,7 +24,7 @@ type Clerk struct {
 func MakeClerk(clnt *tester.Clnt, servers []string) kvtest.IKVClerk {
 	ck := &Clerk{clnt: clnt, servers: servers}
 	ck.leader = 0
-	ck.clientID = rand.Int64()
+	ck.clientID = rand.Int63()
 	ck.seq = 0
 	return ck
 }
@@ -99,7 +99,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 }
 
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
-	raft.DPrintf("[Client][PUT ENTER] Clerk Put key")
+	raft.DPrintf("[Client][PUT ENTER] Clerk Put key=%s value=%s version=%d", key, value, version)
 	seq := atomic.AddInt64(&ck.seq, 1)
 	putArgs := rpc.PutArgs{
 		Key:      key,
