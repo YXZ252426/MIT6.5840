@@ -2,6 +2,9 @@ package shardgrp
 
 import (
 	"bytes"
+	"maps"
+	"math/rand"
+	"reflect"
 	"sync"
 	"sync/atomic"
 
@@ -20,87 +23,88 @@ type Entry struct {
 	Version rpc.Tversion
 }
 
-type CacheEntry struct {
-	LastSeq   int64
-	LastReply rpc.PutReply
+type LastOp struct {
+	Seq   int64
+	Reply rpc.PutReply
+}
+
+type ShardState struct {
+	Owned      bool
+	Frozen     bool
+	MaxNumSeen shardcfg.Tnum
+	Stores     map[string]Entry
+	LastOps    map[int64]LastOp
 }
 
 type Shard struct {
-	mu     sync.RWMutex
-	owned  bool
-	frozen bool
-	// the largest shard-configuration number this shard has already processed.
-	maxNumSeen shardcfg.Tnum
-
-	stores map[string]Entry
-	cache  map[int64]CacheEntry
+	mu sync.RWMutex
+	ShardState
 }
 
 type ShardGroup struct {
 	me     int
-	dead   int32 // set by Kill()
+	dead   int32
 	rsm    *rsm.RSM
 	gid    tester.Tgid
 	shards [shardcfg.NShards]*Shard
+	// this field is set for debug
+	id int64
 }
 
 func (grp *ShardGroup) getShard(key string) *Shard {
 	sh := shardcfg.Key2Shard(key)
 	return grp.shards[sh]
 }
+
 func (s *Shard) updateEntry(args *rpc.PutArgs) {
-	s.stores[args.Key] = Entry{
+	s.Stores[args.Key] = Entry{
 		args.Value,
 		args.Version + 1,
 	}
 }
 
 func (s *Shard) updateNum(num shardcfg.Tnum) bool {
-	if num >= s.maxNumSeen {
-		s.maxNumSeen = num
+	if num >= s.MaxNumSeen {
+		s.MaxNumSeen = num
 		return true
 	}
 	return false
 }
 
-func (s *Shard) pack() []byte {
+func (s *Shard) serialize() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(s.stores)
-	e.Encode(s.cache)
+	if e.Encode(s.Stores) != nil || e.Encode(s.LastOps) != nil {
+		panic("Failed to encode Shard state to snapshot data")
+	}
 	return w.Bytes()
 }
 
-func (s *Shard) unpack(data []byte) {
+func (s *Shard) deserialize(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
 	var stores map[string]Entry
-	var cache map[int64]CacheEntry
-	if d.Decode(&stores) != nil || d.Decode(&cache) != nil {
+	var lastOps map[int64]LastOp
+	if d.Decode(&stores) != nil || d.Decode(&lastOps) != nil {
 		panic("Failed to decode Shard state from snapshot data")
 	}
-	s.stores = stores
-	s.cache = cache
+	s.Stores = maps.Clone(stores)
+	s.LastOps = maps.Clone(lastOps)
 }
 
 func (grp *ShardGroup) DoOp(req any) any {
 	switch req := req.(type) {
 	case *rpc.GetArgs:
-		s := grp.getShard(req.Key)
-		return s.doGet(req)
+		return grp.getShard(req.Key).doGet(req)
 	case *rpc.PutArgs:
-		s := grp.getShard(req.Key)
-		return s.doPut(req)
+		return grp.getShard(req.Key).doPut(req)
 	case *shardrpc.FreezeShardArgs:
-		s := grp.shards[req.Shard]
-		return s.doFreeze(req)
+		return grp.shards[req.Shard].doFreeze(req)
 	case *shardrpc.InstallShardArgs:
-		s := grp.shards[req.Shard]
-		return s.doInstall(req)
+		return grp.shards[req.Shard].doInstall(req)
 	case *shardrpc.DeleteShardArgs:
-		s := grp.shards[req.Shard]
-		return s.doDelete(req)
+		return grp.shards[req.Shard].doDelete(req)
 	}
 	return nil
 }
@@ -108,7 +112,12 @@ func (grp *ShardGroup) DoOp(req any) any {
 func (s *Shard) doGet(args *rpc.GetArgs) (reply rpc.GetReply) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if entry, ok := s.stores[args.Key]; ok {
+	// the check is neccesary, if not owned, the corresponding shard will have no data
+	if !s.Owned {
+		reply.Err = rpc.ErrWrongGroup
+		return
+	}
+	if entry, ok := s.Stores[args.Key]; ok {
 		reply.Value, reply.Version = entry.Value, entry.Version
 		reply.Err = rpc.OK
 	} else {
@@ -120,16 +129,19 @@ func (s *Shard) doGet(args *rpc.GetArgs) (reply rpc.GetReply) {
 func (s *Shard) doPut(args *rpc.PutArgs) (reply rpc.PutReply) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.owned {
+	if !s.Owned {
 		reply.Err = rpc.ErrWrongGroup
+		return
 	}
-	if s.frozen {
+	if s.Frozen {
 		reply.Err = rpc.ErrShardFrozen
+		return
 	}
-	if entry, ok := s.cache[args.ClientID]; ok && args.Seq == entry.LastSeq {
-		return entry.LastReply
+	if op, ok := s.LastOps[args.ClientID]; ok && args.Seq == op.Seq {
+		raft.DPrintf("[SHARDGROUP] Duplicate Put request detected: %v", op.Reply)
+		return op.Reply
 	}
-	if entry, ok := s.stores[args.Key]; ok {
+	if entry, ok := s.Stores[args.Key]; ok {
 		if entry.Version == args.Version {
 			s.updateEntry(args)
 			reply.Err = rpc.OK
@@ -144,9 +156,9 @@ func (s *Shard) doPut(args *rpc.PutArgs) (reply rpc.PutReply) {
 			reply.Err = rpc.ErrNoKey
 		}
 	}
-	s.cache[args.ClientID] = CacheEntry{
-		LastSeq:   args.Seq,
-		LastReply: reply,
+	s.LastOps[args.ClientID] = LastOp{
+		Seq:   args.Seq,
+		Reply: reply,
 	}
 	return
 }
@@ -154,16 +166,17 @@ func (s *Shard) doPut(args *rpc.PutArgs) (reply rpc.PutReply) {
 func (s *Shard) doFreeze(args *shardrpc.FreezeShardArgs) (reply shardrpc.FreezeShardReply) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.owned {
+	if !s.Owned {
 		reply.Err = rpc.ErrWrongGroup
 		return
 	}
 	if !s.updateNum(args.Num) {
-		reply.Num, reply.Err = s.maxNumSeen, rpc.ErrStaleNum
+		reply.Num, reply.Err = s.MaxNumSeen, rpc.ErrStaleNum
+		return
 	}
-	s.frozen = true
-	reply.Num, reply.Err = s.maxNumSeen, rpc.OK
-	reply.State = s.pack()
+	s.Frozen = true
+	reply.Num, reply.Err = s.MaxNumSeen, rpc.OK
+	reply.State = s.serialize()
 	return
 }
 
@@ -174,8 +187,8 @@ func (s *Shard) doInstall(args *shardrpc.InstallShardArgs) (reply shardrpc.Insta
 		reply.Err = rpc.ErrStaleNum
 		return
 	}
-	s.unpack(args.State)
-	s.owned, s.frozen = true, false
+	s.deserialize(args.State)
+	s.Owned, s.Frozen = true, false
 	reply.Err = rpc.OK
 	return
 }
@@ -183,138 +196,90 @@ func (s *Shard) doInstall(args *shardrpc.InstallShardArgs) (reply shardrpc.Insta
 func (s *Shard) doDelete(args *shardrpc.DeleteShardArgs) (reply shardrpc.DeleteShardReply) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.owned {
-		reply.Err = rpc.ErrWrongGroup
-		return
-	}
 	if !s.updateNum(args.Num) {
 		reply.Err = rpc.ErrStaleNum
 		return
 	}
-	s.owned, s.frozen = false, false
-	s.stores = make(map[string]Entry)
-	s.cache = make(map[int64]CacheEntry)
+	if !s.Owned {
+		s.Frozen = false
+		s.LastOps = make(map[int64]LastOp)
+		reply.Err = rpc.OK
+		return
+	}
+	s.Owned, s.Frozen = false, false
+	s.Stores = make(map[string]Entry)
+	s.LastOps = make(map[int64]LastOp)
 	reply.Err = rpc.OK
 	return
 }
 
-type shardHdr struct {
-	Owned  bool
-	Frozen bool
-	Num    shardcfg.Tnum
-	Blob   []byte
-}
-
 func (grp *ShardGroup) Snapshot() []byte {
-	hdrs := make([]shardHdr, shardcfg.NShards)
+	states := make([]ShardState, shardcfg.NShards)
 	for i := 0; i < shardcfg.NShards; i++ {
 		s := grp.shards[i]
 		s.mu.RLock()
-		hdrs[i] = shardHdr{
-			Owned:  s.owned,
-			Frozen: s.frozen,
-			Num:    s.maxNumSeen,
-			Blob:   s.pack(),
-		}
+		state := s.ShardState
+		state.Stores = maps.Clone(state.Stores)
+		state.LastOps = maps.Clone(state.LastOps)
+		states[i] = state
 		s.mu.RUnlock()
 	}
-	var w bytes.Buffer
-	e := labgob.NewEncoder(&w)
-	e.Encode(hdrs)
+
+	w := new(bytes.Buffer)
+	labgob.NewEncoder(w).Encode(states)
 	return w.Bytes()
 }
 
 func (grp *ShardGroup) Restore(data []byte) {
-	var hdrs []shardHdr
 	d := labgob.NewDecoder(bytes.NewReader(data))
-	if d.Decode(hdrs) != nil || len(hdrs) != shardcfg.NShards {
-		panic("Failed to decode ShardGroup Snapshot")
+
+	var states []ShardState
+	if d.Decode(&states) != nil {
+		panic("Failed to decode ShardGroup snapshot")
 	}
+
 	for i := 0; i < shardcfg.NShards; i++ {
 		s := grp.shards[i]
-		h := hdrs[i]
 		s.mu.Lock()
-		s.owned, s.frozen, s.maxNumSeen = h.Owned, h.Frozen, h.Num
-		s.unpack(h.Blob)
+		s.ShardState = states[i]
 		s.mu.Unlock()
 	}
 }
 
-func (grp *ShardGroup) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
-	raft.DPrintf("[SERVER][GET ENTER] ShardGroup %d Get key=%s", grp.me, args.Key)
-	defer raft.DPrintf("[SERVER][GET RETURN] ShardGroup %d Get return %v", grp.me, reply)
+func handleRPC[A any, R any](grp *ShardGroup, op string, args *A, reply *R) {
+	raft.DPrintf("[SERVER][%s ENTER] ShardGroup %d server=%d %s with args=%v", op, grp.id, grp.me, op, args)
+	defer raft.DPrintf("[SERVER][%s RETURN] ShardGroup %d server=%d %s return with reply=%v", op, grp.id, grp.me, op, reply)
 
 	err, res := grp.rsm.Submit(args)
 	if err == rpc.OK {
-		*reply = res.(rpc.GetReply)
+		*reply = res.(R)
 	} else {
-		reply.Err = err
+		reflect.ValueOf(reply).Elem().FieldByName("Err").Set(reflect.ValueOf(err))
 	}
+}
+
+func (grp *ShardGroup) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
+	handleRPC(grp, "GET", args, reply)
 }
 
 func (grp *ShardGroup) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
-	raft.DPrintf("[SERVER][PUT ENTER] ShardGroup %d Put key=%s", grp.me, args.Key)
-	defer raft.DPrintf("[SERVER][PUT RETURN] ShardGroup %d Put return %v", grp.me, reply)
-
-	err, res := grp.rsm.Submit(args)
-	if err == rpc.OK {
-		*reply = res.(rpc.PutReply)
-	} else {
-		reply.Err = err
-	}
+	handleRPC(grp, "PUT", args, reply)
 }
 
-// Freeze the specified shard (i.e., reject future Get/Puts for this
-// shard) and return the key/values stored in that shard.
 func (grp *ShardGroup) FreezeShard(args *shardrpc.FreezeShardArgs, reply *shardrpc.FreezeShardReply) {
-	raft.DPrintf("[SERVER][FREEZE ENTER] ShardGroup %d FreezeShard shard=%d", grp.me, args.Shard)
-	defer raft.DPrintf("[SERVER][FREEZE RETURN] ShardGroup %d freeze shard %d, return err=%v", grp.me, args.Shard, reply.Err)
-	err, res := grp.rsm.Submit(args)
-	if err == rpc.OK {
-		*reply = res.(shardrpc.FreezeShardReply)
-	} else {
-		reply.Err = err
-	}
-
+	handleRPC(grp, "FREEZE", args, reply)
 }
 
-// Install the supplied state for the specified shard.
 func (grp *ShardGroup) InstallShard(args *shardrpc.InstallShardArgs, reply *shardrpc.InstallShardReply) {
-	raft.DPrintf("[SERVER][INSTALL ENTER] ShardGroup %d InstallShard shard=%d", grp.me, args.Shard)
-	defer raft.DPrintf("[SERVER][INSTALL RETURN] ShardGroup %d InstallShard shard=%d return %v", grp.me, args.Shard, reply)
-
-	err, res := grp.rsm.Submit(args)
-	if err == rpc.OK {
-		*reply = res.(shardrpc.InstallShardReply)
-	} else {
-		reply.Err = rpc.Err(err)
-	}
+	handleRPC(grp, "INSTALL", args, reply)
 }
 
-// Delete the specified shard.
 func (grp *ShardGroup) DeleteShard(args *shardrpc.DeleteShardArgs, reply *shardrpc.DeleteShardReply) {
-	raft.DPrintf("[SERVER][DELETE ENTER] ShardGroup %d DeleteShard shard=%d", grp.me, args.Shard)
-	defer raft.DPrintf("[SERVER][DELETE RETURN] ShardGroup %d DeleteShard shard=%d return %v", grp.me, args.Shard, reply)
-
-	err, res := grp.rsm.Submit(args)
-	if err == rpc.OK {
-		*reply = res.(shardrpc.DeleteShardReply)
-	} else {
-		reply.Err = rpc.Err(err)
-	}
+	handleRPC(grp, "DELETE", args, reply)
 }
 
-// the tester calls Kill() when a KVServer instance won't
-// be needed again. for your convenience, we supply
-// code to set rf.dead (without needing a lock),
-// and a killed() method to test rf.dead in
-// long-running loops. you can also add your own
-// code to Kill(). you're not required to do anything
-// about this, but it may be convenient (for example)
-// to suppress debug output from a Kill()ed instance.
 func (grp *ShardGroup) Kill() {
 	atomic.StoreInt32(&grp.dead, 1)
-	// Your code here, if desired.
 }
 
 func (grp *ShardGroup) killed() bool {
@@ -322,13 +287,7 @@ func (grp *ShardGroup) killed() bool {
 	return z == 1
 }
 
-// StartShardServerGrp starts a server for shardgrp `gid`.
-//
-// StartShardServerGrp() and MakeRSM() must return quickly, so they should
-// start goroutines for any long-running work.
 func StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persister *tester.Persister, maxraftstate int) []tester.IService {
-	// call labgob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(&rpc.PutArgs{})
 	labgob.Register(&rpc.GetArgs{})
 	labgob.Register(&shardrpc.FreezeShardArgs{})
@@ -336,21 +295,24 @@ func StartServerShardGrp(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, p
 	labgob.Register(&shardrpc.DeleteShardArgs{})
 	labgob.Register(rsm.Op{})
 	labgob.Register(Entry{})
-	labgob.Register(CacheEntry{})
-	labgob.Register(shardHdr{})
+	labgob.Register(ShardState{})
 	labgob.Register(map[string]Entry{})
-	labgob.Register(map[int64]CacheEntry{})
+	labgob.Register(LastOp{})
+	labgob.Register(map[int64]LastOp{})
 
-	g := &ShardGroup{gid: gid, me: me}
+	g := &ShardGroup{gid: gid, me: me, id: rand.Int63()}
 	for i := 0; i < shardcfg.NShards; i++ {
 		g.shards[i] = &Shard{
-			stores: make(map[string]Entry),
-			cache:  make(map[int64]CacheEntry),
-		}
-		if gid == shardcfg.Gid1 {
-			g.shards[i].owned = true
+			ShardState: ShardState{
+				Owned:      gid == shardcfg.Gid1,
+				Frozen:     false,
+				MaxNumSeen: 0,
+				Stores:     make(map[string]Entry),
+				LastOps:    make(map[int64]LastOp),
+			},
 		}
 	}
+
 	g.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, g)
 	return []tester.IService{g, g.rsm.Raft()}
 }
