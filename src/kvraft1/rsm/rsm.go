@@ -170,7 +170,7 @@ func (rsm *RSM) reader() {
 
 func (rsm *RSM) handleCommand(msg raftapi.ApplyMsg) {
 	op, ok := msg.Command.(Op)
-	if !ok {
+	if !ok || op.Req == nil {
 		return
 	}
 
