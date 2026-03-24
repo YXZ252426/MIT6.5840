@@ -81,7 +81,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	for {
 		grpCk := ck.genGrpClerk(key)
 		value, version, err := grpCk.Get(key)
-		if err == rpc.ErrWrongGroup || err == rpc.ErrShardFrozen {
+		if err == rpc.ErrWrongGroup || err == rpc.ErrShardFrozen || err == rpc.ErrUnreachable {
 			if err == rpc.ErrShardFrozen {
 				time.Sleep(50 * time.Millisecond)
 			}
@@ -97,7 +97,7 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion) rpc.Err {
 	for {
 		grpCk := ck.genGrpClerk(key)
 		err := grpCk.Put(key, value, version, ck.clientID, ck.seq)
-		if err == rpc.ErrWrongGroup || err == rpc.ErrShardFrozen {
+		if err == rpc.ErrWrongGroup || err == rpc.ErrShardFrozen || err == rpc.ErrUnreachable {
 			if err == rpc.ErrShardFrozen {
 				time.Sleep(50 * time.Millisecond)
 			}

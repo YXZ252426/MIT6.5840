@@ -44,3 +44,47 @@ pruneCache() 只处理“group 消失了”
 shard ownership 经常变，所以客户端要 updateConfig()
 group clerk 相对稳定，所以可以缓存
 但如果 group 整个消失了，就必须 pruneCache()
+
+## 26.3.24
+
+the conurrent problem when config change
+critical section problem: when shardctrler, shardKV clerk still constantly invoke put and get data, and it will query config, so will 
+it read old config? The question is: can they observe an old config, and if so, is that
+  safe?
+
+changeconfig include a set of shardgrp.Clerk rpc request, and there is a risk of failure, so how can we handle error?
+
+particular attention should be paid to the path from ChangeConfigTo -> migrate -> Clerk.(Freeze, Install, Delete) -> server.(doFreeze, doInstall, doDelete)
+
+here is some of me understanding
+- shardcfg is like a snapshot, when configchange, UpdateConfig is the last stop, so shardKV.client might read old config, but it is acceptable, because the real config has been update by migrate, we frozen, we lock, we just have not create the final new snapshot yet. As a result it is critical section safe.
+- migrate use for loop,  and will it result in infinite loop? No, migrate's required err is aligned with the return err from Clerk(actually doOp return)
+- config change will not influence the no move shard, to some extent, fearless concurrent, (because no move is not a critical seciton?)
+- migrate involves three steps, when freeze, the dst part is still available until invoke InstallShard it is locked
+- concurrent principle: we should to determine what is the critical section, and when manipulate the critical section, we should consider two question: when manipulate, is it already locked to avoid concurrent access, it is atomic, a transaction, for example, what if freeze success but install failed, it will bring unwished side effect(dead shard?)
+
+Polished Version（prepare for ILETS exam）
+
+  issuing Put and Get requests, and they may also query the current configuration. The question is: can they observe an old config, and if so, is that
+  safe?
+
+  ChangeConfig involves a series of RPCs through shardgrp.Clerk, so failures are possible. That raises another question: how should errors be handled
+  during migration?
+
+  Special attention should be paid to the execution path:
+
+  ChangeConfigTo -> migrate -> Clerk.(Freeze, Install, Delete) -> server.(doFreeze, doInstall, doDelete)
+
+  Here is my current understanding:
+
+  - shardcfg is like a snapshot. During a configuration change, UpdateConfig is the final step. So a ShardKV client may still observe the old config for a
+    while. This is acceptable, because the actual migration has already been performed: the shard is frozen, access is protected by locking, and only the
+    final snapshot has not yet been published. From that perspective, the critical section remains safe.
+  - migrate uses a retry loop. Could that lead to an infinite loop? In principle, no, because the expected errors in migrate are aligned with the errors
+    returned by Clerk calls, which ultimately come from doOp.
+  - A configuration change should not affect shards that do not move. To some extent, those shards can continue serving requests concurrently, because they
+    are outside the critical section.
+  - Migration consists of three steps. After Freeze, the destination side is still available. It is only locked when InstallShard is invoked.
+  - The key concurrency principle is to identify the true critical section. Once we know what belongs to that section, we need to ask two questions: first,
+    is it properly locked to prevent concurrent access; second, is the whole operation atomic enough? For example, if Freeze succeeds but Install fails,
+    could that leave the system in an undesired intermediate state, such as an unavailable or orphaned shard?
