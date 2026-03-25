@@ -16,22 +16,26 @@ const (
 	requestTimeout = 1 * time.Second
 )
 
+// Clerk is a client for a shard group
 type Clerk struct {
 	clnt    *tester.Clnt
 	servers []string
 	leader  int
 }
 
+// MakeClerk creates a new Clerk
 func MakeClerk(clnt *tester.Clnt, servers []string) *Clerk {
 	ck := &Clerk{clnt: clnt, servers: servers}
 	ck.leader = 0
 	return ck
 }
 
+// bumpLeader advances to the next server in the list
 func (ck *Clerk) bumpLeader() {
 	ck.leader = (ck.leader + 1) % len(ck.servers)
 }
 
+// sendRPC sends a RPC to the shard group, retrying as necessary
 func sendRPC[A any, R any](ck *Clerk, method string, args *A, reply *R) (err rpc.Err) {
 	raft.DPrintf("[Client][%s ENTRY] Clerk %s with args=%v", method, method, args)
 	defer func() {
@@ -63,6 +67,7 @@ func sendRPC[A any, R any](ck *Clerk, method string, args *A, reply *R) (err rpc
 	}
 }
 
+// Get fetches the value for a key
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	args := rpc.GetArgs{Key: key}
 	reply := rpc.GetReply{}
@@ -70,6 +75,7 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	return reply.Value, reply.Version, err
 }
 
+// Put sets the value to a key
 func (ck *Clerk) Put(key string, value string, version rpc.Tversion, clientID int64, seq int64) rpc.Err {
 
 	putArgs := rpc.PutArgs{
@@ -84,6 +90,7 @@ func (ck *Clerk) Put(key string, value string, version rpc.Tversion, clientID in
 	return err
 }
 
+// FreezeShard freezes the shard and returns its state
 func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.Err) {
 	args := shardrpc.FreezeShardArgs{
 		Shard: s,
@@ -94,6 +101,7 @@ func (ck *Clerk) FreezeShard(s shardcfg.Tshid, num shardcfg.Tnum) ([]byte, rpc.E
 	return reply.State, err
 }
 
+// InstallShard installs the shard with the given state
 func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum) rpc.Err {
 	args := shardrpc.InstallShardArgs{
 		Shard: s,
@@ -105,6 +113,7 @@ func (ck *Clerk) InstallShard(s shardcfg.Tshid, state []byte, num shardcfg.Tnum)
 	return err
 }
 
+// DeleteShard deletes the shard
 func (ck *Clerk) DeleteShard(s shardcfg.Tshid, num shardcfg.Tnum) rpc.Err {
 	args := shardrpc.DeleteShardArgs{
 		Shard: s,
